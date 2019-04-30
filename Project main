@@ -1,0 +1,169 @@
+import pandas as pd
+import numpy as np
+from robobrowser import RoboBrowser
+import requests
+from bs4 import BeautifulSoup
+import datetime
+import time
+from plotly.offline import init_notebook_mode, iplot
+from sklearn import linear_model
+from operator import itemgetter
+def get_data(ticker):    
+    q = RoboBrowser()
+    ref = 'https://finance.yahoo.com'
+    q.open(ref)
+    form = q.get_form(action ='/quote/')
+    form['yfin-usr-qry'] = ticker
+    q.submit_form(form)
+    try:
+        Beta_coefficient = float(q.parsed.findAll('table')[1].findAll('span')[3].text)
+    except:
+        Beta_coefficient = 2.2250738585072014e-308
+    historical_data = q.parsed.findAll('a')[5]['href']
+    q.open(ref+historical_data)
+    return ref+historical_data, Beta_coefficient
+def get_ticker(name):
+    df = pd.read_csv('Tickers.csv', sep = ';',error_bad_lines=False)
+    tickers_data = df.iloc[:,:-11]
+    return tickers_data[tickers_data['Name'] == name]['Ticker'].iat[0]
+def table_cleaner(df):
+    df = df.set_index('Date')
+    df = df.dropna()
+    df = df[1:]
+    return df
+def get_api_data(link):    
+    api_link = link[:link.find('?')+1]
+    years_to_analyze = 10
+    current_date = int(time.mktime(datetime.date.today().timetuple()))
+    begin_date = int(time.mktime(datetime.date.today().timetuple())-years_to_analyze*365.25*24*60*60)
+    params = {
+        'period1':begin_date,
+        'period2':current_date,
+        'interval':'1mo',
+        'filter':'history',
+        'frequency':'1mo'
+    }
+    data = requests.get(api_link, params = params)
+    return data.text
+def get_table(data):
+    table = data.findAll('table')[0]
+    df = pd.read_html(str(table))[0]
+    df = table_cleaner(df)
+    return df
+def calculate_stat(df):    
+    df['shifted'] = df['Adj Close**'].shift(-1,axis=0)
+    df = df.dropna()
+    df['Return'] = df['Adj Close**']/df['shifted']-1
+    df = df.drop(['Open','High','Low','Close*','Volume','shifted'], axis = 1)
+    return df
+def get_macro_data(years, ticker):
+    if ticker == 'SP500':
+        api_link = 'https://finance.yahoo.com/quote/%5EGSPC/history?'
+    elif ticker == 'Treasury bill':
+        api_link = 'https://finance.yahoo.com/quote/%5ETNX/history?'
+    years_to_analyze = years
+    current_date = int(time.mktime(datetime.date.today().timetuple()))
+    begin_date = int(time.mktime(datetime.date.today().timetuple())-years_to_analyze*365.25*24*60*60)
+    params = {
+        'period1':begin_date,
+        'period2':current_date,
+        'interval':'1mo',
+        'filter':'history',
+        'frequency':'1mo'
+    }
+    data = requests.get(api_link, params = params)
+    data = BeautifulSoup(data.text, features='xml')
+    Table = get_table(data)
+    Table = calculate_stat(Table)
+    if ticker == 'SP500':
+        SP500_table = Table.rename(columns = {'Adj Close**':'SP500 Price','Return':'SP500 Return'})
+        return SP500_table
+    elif ticker == 'Treasury bill':
+        TBill_table = Table.rename(columns = {'Adj Close**':'Tbill Price','Return':'Tbill Return'})
+        return TBill_table
+def prepare_data(our_data, Stock):
+    our_data = our_data.rename(columns = {'Adj Close**':Stock+' price'})
+    our_data[Stock+' - Tbill Returns'] = our_data['Return'] - our_data['Tbill Price']
+    our_data['SP500 - Tbill Returns'] = our_data['SP500 Return'] - our_data['Tbill Price']
+    Y = our_data[Stock+' - Tbill Returns']
+    X = our_data.iloc[:,-3:].drop(Stock+' - Tbill Returns', axis = 1)
+    X['ones'] = 1
+    return X, Y
+def regression(X,Y):
+    lr = linear_model.LinearRegression()
+    lr.fit(X,Y)
+    return lr
+def prediction (beta_model, beta_parsed, Stock):
+    if (beta_parsed - beta_model)>0.2*beta_model:
+        return 'You need to BUY ' + Stock
+    elif (beta_model - beta_parsed)>0.2*beta_model:
+        return 'You need to SELL ' + Stock
+    else:
+        return 'Hold the '+ Stock + ' for better times'
+def main(Name):
+    Stock = get_ticker(Name)
+    link, Beta_coefficient = get_data(Stock)
+    data = BeautifulSoup(get_api_data(link), features='xml')
+    our_data = get_table(data)
+    SP500_data = get_macro_data(10,'SP500')
+    Tbill_data = get_macro_data(10,'Treasury bill')
+    our_data = calculate_stat(our_data)
+    our_data = our_data.join(SP500_data)
+    our_data = our_data.join(Tbill_data)
+    
+    init_notebook_mode()
+    graph_1 = {'x': our_data.index, 'y': our_data['Return'], 'line':{'color':'rgb(200,0,0)','width':2}, 'name':Stock+ ' Return'}
+    graph_2 = {'x': our_data.index, 'y': our_data['SP500 Return'], 'line':{'color':'rgb(0,0,200)','width':2, 'dash':'dash'},'name':'SP500 Return'}
+    graph_3 = {'x': our_data.index, 'y': our_data['Tbill Return'], 'line':{'color':'rgb(0,200,0)','width':2, 'dash':'dot'},'name':'Tbill Return'}
+    data = [graph_1, graph_2, graph_3]
+    label = {'title' : 'Returns of '+Stock+' compared to the market (SP500)',
+              'yaxis' : {'title' : 'Return'}}
+    figure = {'data':data,'layout':label}
+    iplot(figure)
+    init_notebook_mode()
+    iplot([{'x': our_data.index, 'y': our_data['Adj Close**'], 'mode': 'lines+markers', 'name':Stock + ' Price'}])
+    
+    X, Y = prepare_data(our_data, Stock)
+    model = regression (X, Y)
+    print('\033[0m' + 'Results of standard regression for CAPM:')
+    print('Intercept: {0:0.3f}'.format(model.intercept_))
+    print('Coefficients: {0:0.3f}, {1:0.3f}'.format(model.coef_[0],model.coef_[1]))
+    print('R-squared: {0:0.3f}'.format(model.score(X,Y)))
+    
+    print('\033[1m'+ prediction(model.coef_[1], Beta_coefficient, Stock))
+Stock = input()
+main(Stock)
+t = time.time()
+df = pd.read_csv('Tickers.csv', sep = ';',error_bad_lines=False)
+tickers_data = df.iloc[:,:-11]
+for i in range(5):
+    name = tickers_data['Name'].iat[i]
+    main(name)
+print("Completion time = ", '{0:0.2f}'.format (time.time()-t))
+def make_my_portfolio(number_of_stocks):
+    df = pd.read_csv('Tickers.csv', sep = ';',error_bad_lines=False)
+    tickers_data = df.iloc[:,:-11]
+    portfolio = []
+    for i in range(number_of_stocks-1):
+        name = tickers_data['Name'].iat[i]
+        Stock = get_ticker(name)
+        link, Beta_coefficient = get_data(Stock)
+        data = BeautifulSoup(get_api_data(link), features='xml')
+        our_data = get_table(data)
+        SP500_data = get_macro_data(10,'SP500')
+        Tbill_data = get_macro_data(10,'Treasury bill')
+        our_data = calculate_stat(our_data)
+        our_data = our_data.join(SP500_data)
+        our_data = our_data.join(Tbill_data)
+        X, Y = prepare_data(our_data, Stock)
+        model = regression (X, Y)
+        answer = prediction(model.coef_[1], Beta_coefficient, Stock)
+        if answer == 'You need to BUY ' + Stock:
+            portfolio.append([tickers_data[tickers_data['Ticker'] == Stock]['Name'].iat[0],(Beta_coefficient-model.coef_[1])])
+    portfolio = sorted(portfolio, key = itemgetter(1), reverse = True)
+    df = pd.DataFrame(portfolio, columns = ['Stock', 'Beta higher on'])
+    df['weight'] = df['Beta higher on']/df['Beta higher on'].sum()
+    return df
+t = time.time()
+print(make_my_portfolio(35))
+print("Completion time = ", '{0:0.2f}'.format (time.time()-t))
